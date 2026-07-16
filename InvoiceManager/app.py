@@ -10,6 +10,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A5, landscape
@@ -117,7 +120,22 @@ class Database:
                 items_json TEXT NOT NULL, created_at TEXT NOT NULL
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                packing TEXT,
+                rate REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
         self.conn.commit()
+        if not self.conn.execute("SELECT 1 FROM products LIMIT 1").fetchone():
+            for (items_json,) in self.conn.execute("SELECT items_json FROM invoices"):
+                try:
+                    self.save_products(json.loads(items_json))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
 
     def save(self, data: dict) -> int:
         cur = self.conn.execute("""
@@ -145,6 +163,31 @@ class Database:
         data = dict(zip(keys, row))
         data["items"] = json.loads(data.pop("items_json"))
         return data
+
+    def save_products(self, items):
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in items:
+            name = str(item.get("product", "")).strip()
+            if not name:
+                continue
+            self.conn.execute("""
+                INSERT INTO products(name, packing, rate, updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET
+                    packing=excluded.packing,
+                    rate=excluded.rate,
+                    updated_at=excluded.updated_at
+            """, (name, str(item.get("packing", "")).strip(),
+                  float(item.get("rate", 0) or 0), now))
+        self.conn.commit()
+
+    def products(self):
+        rows = self.conn.execute("""
+            SELECT name, packing, rate FROM products
+            ORDER BY name COLLATE NOCASE
+        """).fetchall()
+        return [{"product": row[0], "packing": row[1] or "", "rate": row[2] or 0}
+                for row in rows]
 
 
 class InvoiceApp(tk.Tk):
@@ -209,6 +252,8 @@ class InvoiceApp(tk.Tk):
         actions.pack(side="right", padx=25, pady=17)
         ttk.Button(actions, text="＋ New", style="Secondary.TButton", command=self.new_invoice).pack(side="left", padx=5)
         ttk.Button(actions, text="History", style="Secondary.TButton", command=self.show_history).pack(side="left", padx=5)
+        ttk.Button(actions, text="Excel Import", style="Secondary.TButton", command=self.import_excel).pack(side="left", padx=5)
+        ttk.Button(actions, text="Excel Export", style="Secondary.TButton", command=self.export_excel).pack(side="left", padx=5)
         ttk.Button(actions, text="Settings", style="Secondary.TButton", command=self.show_settings).pack(side="left", padx=5)
         ttk.Button(actions, text="Save PDF", style="Accent.TButton", command=self.create_pdf).pack(side="left", padx=5)
         ttk.Button(actions, text="Print", style="Accent.TButton", command=self.print_invoice).pack(side="left", padx=5)
@@ -279,9 +324,37 @@ class InvoiceApp(tk.Tk):
         labels = ("Product Name", "Packing", "Quantity", "Rate", "Scheme", "Scheme Value")
         vals = current or ("", "", "1", "0", "0", "0")
         variables = {k: tk.StringVar(value=str(v)) for k, v in zip(keys, vals)}
+        product_catalog = self.db.products()
+        product_names = [item["product"] for item in product_catalog]
+        product_by_name = {item["product"].casefold(): item for item in product_catalog}
+        product_entry = None
+
+        def fill_product_details(_event=None):
+            selected = product_by_name.get(variables["product"].get().strip().casefold())
+            if selected:
+                variables["product"].set(selected["product"])
+                variables["packing"].set(selected["packing"])
+                variables["rate"].set(money(float(selected["rate"])))
+
+        def filter_products(_event=None):
+            if not product_entry:
+                return
+            typed = variables["product"].get().strip().casefold()
+            matches = [name for name in product_names if name.casefold().startswith(typed)] if typed else product_names
+            product_entry.configure(values=matches)
+            if typed and matches:
+                product_entry.after_idle(lambda: product_entry.event_generate("<Down>"))
+
         for i, (key, label) in enumerate(zip(keys, labels)):
             ttk.Label(win, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", padx=20, pady=8)
-            entry = ttk.Entry(win, textvariable=variables[key], width=45)
+            if key == "product":
+                entry = ttk.Combobox(win, textvariable=variables[key], width=42,
+                                     values=product_names)
+                product_entry = entry
+                entry.bind("<KeyRelease>", filter_products)
+                entry.bind("<<ComboboxSelected>>", fill_product_details)
+            else:
+                entry = ttk.Entry(win, textvariable=variables[key], width=45)
             entry.grid(row=i, column=1, padx=20, pady=8)
             if i == 0:
                 entry.focus_set()
@@ -296,6 +369,7 @@ class InvoiceApp(tk.Tk):
                     raise ValueError("Product name is required")
                 result.extend([variables["product"].get().strip(), variables["packing"].get().strip(),
                                qty, rate, scheme, scheme_value])
+                self.db.save_products([{"product": result[0], "packing": result[1], "rate": result[3]}])
                 win.destroy()
             except ValueError as exc:
                 messagebox.showerror("Invalid entry", str(exc), parent=win)
@@ -346,6 +420,143 @@ class InvoiceApp(tk.Tk):
                            "scheme_value": float(str(v[6]).replace(",", "")), "total": float(str(v[7]).replace(",", ""))})
         return result
 
+    @staticmethod
+    def excel_number(value, default=0):
+        if value is None or value == "":
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        return float(str(value).replace(",", "").strip())
+
+    def export_excel(self):
+        default_name = f"Client-Products-{self.vars['distributor'].get().strip() or 'Template'}.xlsx"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export client product template",
+            initialdir=BASE, initialfile=default_name,
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")]
+        )
+        if not path:
+            return
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Client Products"
+            accent = self.settings["accent"].replace("#", "")
+            ws["A1"] = self.settings["company"]
+            ws["A1"].font = Font(size=16, bold=True, color="FFFFFF")
+            ws["A1"].fill = PatternFill("solid", fgColor=accent)
+            ws.merge_cells("A1:H1")
+            ws["A2"] = "Client Product / Invoice Template"
+            ws["A2"].font = Font(size=12, bold=True)
+            labels = [
+                ("A4", "Distributor", "B4", self.vars["distributor"].get()),
+                ("D4", "Town", "E4", self.vars["town"].get()),
+                ("A5", "Invoice No.", "B5", self.vars["invoice_no"].get()),
+                ("D5", "Invoice Date", "E5", self.vars["invoice_date"].get()),
+                ("A6", "Reference", "B6", self.vars["reference"].get()),
+                ("D6", "Bilty No.", "E6", self.vars["bilty_no"].get()),
+                ("A7", "Transporter", "B7", self.vars["transporter"].get()),
+                ("D7", "Freight", "E7", self.vars["freight"].get()),
+            ]
+            for label_cell, label, value_cell, value in labels:
+                ws[label_cell] = label
+                ws[label_cell].font = Font(bold=True)
+                ws[value_cell] = value
+            headers = ["Sr No.", "Product Name", "Packing", "Quantity", "Rate",
+                       "Scheme", "Scheme Value", "Total"]
+            header_row = 10
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(header_row, col, header)
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor=accent)
+                cell.alignment = Alignment(horizontal="center")
+            export_items = self.items()
+            if not export_items:
+                export_items = [
+                    {"product": item["product"], "packing": item["packing"], "qty": "",
+                     "rate": item["rate"], "scheme": 0, "scheme_value": 0}
+                    for item in self.db.products()
+                ]
+            for row_no, item in enumerate(export_items, header_row + 1):
+                ws.cell(row_no, 1, row_no - header_row)
+                ws.cell(row_no, 2, item["product"])
+                ws.cell(row_no, 3, item["packing"])
+                ws.cell(row_no, 4, item["qty"])
+                ws.cell(row_no, 5, item["rate"])
+                ws.cell(row_no, 6, item.get("scheme", 0))
+                ws.cell(row_no, 7, item.get("scheme_value", 0))
+                ws.cell(row_no, 8, f"=D{row_no}*E{row_no}-G{row_no}")
+            final_row = max(header_row + 100, header_row + len(export_items))
+            for row_no in range(header_row + 1, final_row + 1):
+                if not ws.cell(row_no, 1).value:
+                    ws.cell(row_no, 1, row_no - header_row)
+                if not ws.cell(row_no, 8).value:
+                    ws.cell(row_no, 8, f'=IF(B{row_no}="","",D{row_no}*E{row_no}-G{row_no})')
+                for col in range(4, 9):
+                    ws.cell(row_no, col).number_format = "#,##0.00"
+            for col, width in enumerate([10, 38, 18, 13, 14, 12, 16, 16], 1):
+                ws.column_dimensions[get_column_letter(col)].width = width
+            ws.freeze_panes = "A11"
+            ws.auto_filter.ref = f"A10:H{final_row}"
+            wb.save(path)
+            messagebox.showinfo(
+                "Excel exported",
+                "Template ready. Products ya quantities edit/add karke isi file ko Excel Import se dobara load karein.",
+                parent=self
+            )
+        except Exception as exc:
+            messagebox.showerror("Excel export failed", str(exc), parent=self)
+
+    def import_excel(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Import client product template",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            wb = load_workbook(path, data_only=False)
+            ws = wb["Client Products"] if "Client Products" in wb.sheetnames else wb.active
+            field_cells = {
+                "distributor": "B4", "town": "E4", "invoice_no": "B5",
+                "invoice_date": "E5", "reference": "B6", "bilty_no": "E6",
+                "transporter": "B7", "freight": "E7",
+            }
+            for key, cell in field_cells.items():
+                value = ws[cell].value
+                if value is not None:
+                    self.vars[key].set(str(value))
+            imported = []
+            for row in range(11, ws.max_row + 1):
+                product = str(ws.cell(row, 2).value or "").strip()
+                qty_value = ws.cell(row, 4).value
+                if not product or qty_value in (None, ""):
+                    continue
+                qty = self.excel_number(qty_value)
+                rate = self.excel_number(ws.cell(row, 5).value)
+                scheme = self.excel_number(ws.cell(row, 6).value)
+                scheme_value = self.excel_number(ws.cell(row, 7).value)
+                packing = str(ws.cell(row, 3).value or "").strip()
+                imported.append({
+                    "product": product, "packing": packing, "qty": qty, "rate": rate,
+                    "scheme": scheme, "scheme_value": scheme_value,
+                    "total": qty * rate - scheme_value,
+                })
+            if not imported:
+                raise ValueError("No product rows found. Product Name and Quantity are required.")
+            self.tree.delete(*self.tree.get_children())
+            for index, item in enumerate(imported, 1):
+                self.tree.insert("", "end", values=(
+                    index, item["product"], item["packing"], money(item["qty"]),
+                    money(item["rate"]), money(item["scheme"]),
+                    money(item["scheme_value"]), money(item["total"])
+                ))
+            self.db.save_products(imported)
+            self.update_summary()
+            messagebox.showinfo("Excel imported", f"{len(imported)} products loaded successfully.", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Excel import failed", str(exc), parent=self)
+
     def totals(self):
         items = self.items()
         qty = sum(x["qty"] for x in items)
@@ -367,6 +578,7 @@ class InvoiceApp(tk.Tk):
         try: data["freight"] = float(data["freight"].replace(",", "") or 0)
         except ValueError: raise ValueError("Freight must be a number.")
         data["items"] = self.items()
+        self.db.save_products(data["items"])
         return data
 
     def create_pdf(self, silent=False):
