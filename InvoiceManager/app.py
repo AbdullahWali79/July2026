@@ -154,6 +154,30 @@ class Database:
                    items_json FROM invoices ORDER BY id DESC LIMIT 300
         """).fetchall()
 
+    def export_backup(self, path):
+        destination = sqlite3.connect(path)
+        try:
+            self.conn.backup(destination)
+        finally:
+            destination.close()
+
+    def import_backup(self, path):
+        source = sqlite3.connect(f"file:{Path(path).resolve().as_posix()}?mode=ro", uri=True)
+        try:
+            integrity = source.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise ValueError("Selected database is damaged or invalid.")
+            tables = {row[0] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            if not {"invoices", "products"}.issubset(tables):
+                raise ValueError("This is not a Finish Invoice Manager database backup.")
+            self.conn.commit()
+            source.backup(self.conn)
+            self.conn.commit()
+        finally:
+            source.close()
+
     def get(self, invoice_id: int):
         row = self.conn.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
         if not row:
@@ -607,15 +631,61 @@ class InvoiceApp(tk.Tk):
         tree = ttk.Treeview(win, columns=("id","no","date","distributor","town","total"), show="headings")
         for col, text, width in (("id","ID",60),("no","Invoice No.",110),("date","Date",120),("distributor","Distributor",270),("town","Town",160),("total","Amount",130)):
             tree.heading(col,text=text); tree.column(col,width=width)
-        for row in self.db.recent():
-            total = sum(x["total"] for x in json.loads(row[6]))
-            tree.insert("","end",values=(row[0],row[1],row[2],row[3],row[4],money(total)))
+        def refresh():
+            tree.delete(*tree.get_children())
+            for row in self.db.recent():
+                total = sum(x["total"] for x in json.loads(row[6]))
+                tree.insert("","end",values=(row[0],row[1],row[2],row[3],row[4],money(total)))
+        refresh()
         tree.pack(fill="both",expand=True,padx=14,pady=14)
         def load():
             sel=tree.selection()
             if not sel:return
             data=self.db.get(int(tree.item(sel[0],"values")[0])); win.destroy(); self.load_invoice(data)
-        ttk.Button(win,text="Load Selected Invoice",style="Accent.TButton",command=load).pack(pady=(0,14))
+        def export_database():
+            default_name = f"Invoice-History-{datetime.now():%Y-%m-%d}.db"
+            path = filedialog.asksaveasfilename(
+                parent=win, title="Export invoice history backup", initialdir=BASE,
+                initialfile=default_name, defaultextension=".db",
+                filetypes=[("Invoice database backup", "*.db")]
+            )
+            if not path:
+                return
+            try:
+                self.db.export_backup(path)
+                messagebox.showinfo("Backup exported", f"History backup saved successfully:\n{path}", parent=win)
+            except Exception as exc:
+                messagebox.showerror("Backup failed", str(exc), parent=win)
+        def import_database():
+            path = filedialog.askopenfilename(
+                parent=win, title="Import invoice history backup",
+                filetypes=[("Invoice database backup", "*.db"), ("All files", "*.*")]
+            )
+            if not path:
+                return
+            if not messagebox.askyesno(
+                "Restore history backup",
+                "Current invoice history and product list will be replaced. Continue?",
+                parent=win
+            ):
+                return
+            safety_path = BASE / f"invoices-before-restore-{datetime.now():%Y%m%d-%H%M%S}.db"
+            try:
+                self.db.export_backup(safety_path)
+                self.db.import_backup(path)
+                refresh()
+                messagebox.showinfo(
+                    "Backup imported",
+                    f"History restored successfully.\nAutomatic safety backup:\n{safety_path}",
+                    parent=win
+                )
+            except Exception as exc:
+                messagebox.showerror("Restore failed", str(exc), parent=win)
+        buttons = ttk.Frame(win)
+        buttons.pack(pady=(0,14))
+        ttk.Button(buttons,text="Load Selected Invoice",style="Accent.TButton",command=load).pack(side="left",padx=5)
+        ttk.Button(buttons,text="Export Database Backup",style="Secondary.TButton",command=export_database).pack(side="left",padx=5)
+        ttk.Button(buttons,text="Import Database Backup",style="Secondary.TButton",command=import_database).pack(side="left",padx=5)
         tree.bind("<Double-1>",lambda _e:load())
 
     def load_invoice(self, data):
