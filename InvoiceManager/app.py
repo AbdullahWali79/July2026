@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from licensing import install_license, machine_code, read_and_validate_license
 
@@ -92,6 +93,11 @@ def app_dir() -> Path:
 BASE = app_dir()
 DB_PATH = BASE / "invoices.db"
 SETTINGS_PATH = BASE / "settings.json"
+
+
+def client_asset_path(*parts) -> Path:
+    root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return root.joinpath(*parts)
 
 
 DEFAULT_SETTINGS = {
@@ -249,12 +255,16 @@ class InvoiceApp(tk.Tk):
         self.new_invoice()
 
     def load_settings(self):
+        settings = DEFAULT_SETTINGS.copy()
         if SETTINGS_PATH.exists():
             try:
-                return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))}
+                settings.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
             except Exception:
                 pass
-        return DEFAULT_SETTINGS.copy()
+        default_logo = client_asset_path("images", "logo.jpeg")
+        if not settings.get("logo") and default_logo.exists():
+            settings["logo"] = str(default_logo)
+        return settings
 
     def setup_style(self):
         self.configure(bg="#F3F6F9")
@@ -384,6 +394,14 @@ class InvoiceApp(tk.Tk):
             if typed and matches:
                 product_entry.after_idle(lambda: product_entry.event_generate("<Down>"))
 
+        def calculate_scheme_value(_event=None):
+            try:
+                qty = float(variables["qty"].get().replace(",", "") or 0)
+                scheme = float(variables["scheme"].get().replace(",", "") or 0)
+                variables["scheme_value"].set(money(qty * scheme))
+            except ValueError:
+                pass
+
         for i, (key, label) in enumerate(zip(keys, labels)):
             ttk.Label(win, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", padx=20, pady=8)
             if key == "product":
@@ -394,6 +412,8 @@ class InvoiceApp(tk.Tk):
                 entry.bind("<<ComboboxSelected>>", fill_product_details)
             else:
                 entry = ttk.Entry(win, textvariable=variables[key], width=45)
+                if key in ("qty", "scheme"):
+                    entry.bind("<KeyRelease>", calculate_scheme_value)
             entry.grid(row=i, column=1, padx=20, pady=8)
             if i == 0:
                 entry.focus_set()
@@ -539,7 +559,8 @@ class InvoiceApp(tk.Tk):
 
     def update_summary(self):
         qty, amount, freight, invoice_total = self.totals()
-        self.summary.configure(text=f"Total Quantity: {money(qty)}     Total Amount: {money(amount)}     Invoice Total: {money(invoice_total)}")
+        scheme_total = sum(x["scheme_value"] for x in self.items())
+        self.summary.configure(text=f"Total Quantity: {money(qty)}     Total Scheme: {money(scheme_total)}     Total Amount: {money(amount)}     Invoice Total: {money(invoice_total)}")
 
     def collect(self):
         if not self.vars["invoice_no"].get().strip():
@@ -578,19 +599,41 @@ class InvoiceApp(tk.Tk):
                                 topMargin=6*mm, bottomMargin=6*mm)
         normal = ParagraphStyle("normal", fontName="Helvetica", fontSize=7.5, leading=9)
         bold = ParagraphStyle("bold", parent=normal, fontName="Helvetica-Bold")
+        brand = ParagraphStyle("brand", parent=bold, fontSize=11, leading=13)
         center = ParagraphStyle("center", parent=bold, alignment=TA_CENTER, fontSize=15, leading=18)
         right = ParagraphStyle("right", parent=normal, alignment=TA_RIGHT)
         story = []
-        top = Table([
-            [Paragraph(f"<b>{self.settings['company']}</b>", bold), Paragraph(self.settings["heading"], center), ""],
-            [Paragraph(f"<b>Distributor:</b> {data['distributor']}", normal), "",
+        logo = ""
+        logo_path = Path(self.settings.get("logo", ""))
+        if logo_path.is_file():
+            logo = Image(str(logo_path))
+            logo._restrictSize(22*mm, 22*mm)
+            logo.hAlign = "RIGHT"
+        header = Table([[
+            Paragraph(f"<b>{self.settings['company']}</b>", brand),
+            Paragraph(self.settings["heading"], center),
+            logo,
+        ]], colWidths=[64.67*mm, 64.66*mm, 64.67*mm], rowHeights=[23*mm])
+        header.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN", (0,0), (0,0), "LEFT"),
+            ("ALIGN", (1,0), (1,0), "CENTER"),
+            ("ALIGN", (2,0), (2,0), "RIGHT"),
+            ("LEFTPADDING", (0,0), (-1,-1), 2),
+            ("RIGHTPADDING", (0,0), (-1,-1), 2),
+        ]))
+        details = Table([
+            [Paragraph(f"<b>Distributor:</b> {data['distributor']}", normal),
              Paragraph(f"<b>Invoice No:</b> {data['invoice_no']}<br/><b>Invoice Date:</b> {data['invoice_date']}", normal)],
-            [Paragraph(f"<b>Town:</b> {data['town']}<br/><b>REF:</b> {data['reference']}", normal), "",
+            [Paragraph(f"<b>Town:</b> {data['town']}<br/><b>REF:</b> {data['reference']}", normal),
              Paragraph(f"<b>Bilty No:</b> {data['bilty_no']}<br/><b>Transporter:</b> {data['transporter']}", normal)]
-        ], colWidths=[70*mm, 54*mm, 70*mm])
-        top.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("SPAN", (1,0), (2,0)),
-                                 ("ALIGN", (1,0), (2,0), "CENTER"), ("BOTTOMPADDING", (0,0), (-1,-1), 5)]))
-        story.extend([top, Spacer(1, 2*mm)])
+        ], colWidths=[97*mm, 97*mm])
+        details.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("ALIGN", (1,0), (1,-1), "RIGHT"),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ]))
+        story.extend([header, details, Spacer(1, 2*mm)])
         rows = [["Sr No.", "Product Name", "Packing", "Quantity", "Rate", "Scheme", "Scheme Value", "Total"]]
         for i, x in enumerate(data["items"], 1):
             rows.append([str(i), x["product"], x["packing"], money(x["qty"]), money(x["rate"]),
@@ -604,8 +647,10 @@ class InvoiceApp(tk.Tk):
         ]))
         story.append(table)
         qty, amount, freight, invoice_total = self.totals()
+        scheme_total = sum(x["scheme_value"] for x in data["items"])
         summary = Table([
             [Paragraph(f"<b>Total Quantity:</b> {money(qty)}", right), Paragraph(f"<b>Total Amount:</b> {money(amount)}", right)],
+            [Paragraph(f"<b>Total Scheme Value:</b> {money(scheme_total)}", right), ""],
             ["", Paragraph(f"<b>Freight:</b> {money(freight)}", right)],
             ["", Paragraph(f"<b>Invoice Total:</b> {money(invoice_total)}", right)],
         ], colWidths=[97*mm, 97*mm])
@@ -697,16 +742,35 @@ class InvoiceApp(tk.Tk):
         self.update_summary()
 
     def show_settings(self):
-        win=tk.Toplevel(self); win.title("Company Settings"); win.geometry("520x300"); win.transient(self); win.grab_set(); win.configure(bg="white")
+        win=tk.Toplevel(self); win.title("Company Settings"); win.geometry("650x390"); win.transient(self); win.grab_set(); win.configure(bg="white")
         company=tk.StringVar(value=self.settings["company"]); heading=tk.StringVar(value=self.settings["heading"])
         for i,(label,var) in enumerate((("Company Name",company),("Invoice Heading",heading))):
             ttk.Label(win,text=label,style="Card.TLabel").grid(row=i,column=0,padx=20,pady=14,sticky="w")
             ttk.Entry(win,textvariable=var,width=38).grid(row=i,column=1,padx=20,pady=14)
+        logo=tk.StringVar(value=self.settings.get("logo", ""))
+        ttk.Label(win,text="Invoice Logo",style="Card.TLabel").grid(row=2,column=0,padx=20,pady=14,sticky="w")
+        logo_entry=ttk.Entry(win,textvariable=logo,width=48,state="readonly")
+        logo_entry.grid(row=2,column=1,padx=(20,5),pady=14,sticky="ew")
+        def choose_logo():
+            path=filedialog.askopenfilename(
+                parent=win,title="Choose invoice logo",
+                filetypes=[("Image files","*.png;*.jpg;*.jpeg"),("All files","*.*")]
+            )
+            if not path:return
+            suffix=Path(path).suffix.lower() if Path(path).suffix else ".png"
+            saved_logo=BASE / f"company-logo{suffix}"
+            shutil.copy2(path,saved_logo)
+            logo.set(str(saved_logo))
+        ttk.Button(win,text="Choose / Update",style="Secondary.TButton",command=choose_logo).grid(row=2,column=2,padx=(5,20),pady=14)
+        ttk.Label(
+            win,text="Logo PDF ke top-right corner mein display hoga.",style="Card.TLabel"
+        ).grid(row=3,column=1,columnspan=2,padx=20,sticky="w")
         def save():
-            self.settings.update(company=company.get().strip(),heading=heading.get().strip())
+            self.settings.update(company=company.get().strip(),heading=heading.get().strip(),logo=logo.get().strip())
             SETTINGS_PATH.write_text(json.dumps(self.settings,indent=2),encoding="utf-8")
-            messagebox.showinfo("Settings","Settings saved. Restart the app to refresh the header.",parent=win); win.destroy()
-        ttk.Button(win,text="Save Settings",style="Accent.TButton",command=save).grid(row=3,column=0,columnspan=2,pady=30)
+            messagebox.showinfo("Settings","Settings saved. New PDFs will use the updated logo and heading.",parent=win); win.destroy()
+        win.columnconfigure(1,weight=1)
+        ttk.Button(win,text="Save Settings",style="Accent.TButton",command=save).grid(row=4,column=0,columnspan=3,pady=34)
 
 
 if __name__ == "__main__":

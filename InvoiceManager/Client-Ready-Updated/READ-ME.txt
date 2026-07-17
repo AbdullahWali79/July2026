@@ -1,0 +1,38 @@
+FINISH INVOICE MANAGER - CLIENT FILES
+
+1. FinishInvoiceManager.exe ko double-click karke open karein.
+2. Pehli dafa screen par Machine Code nazar aayega.
+3. Machine Code software owner ko WhatsApp karein.
+4. Owner se mili .lic file ko Import .lic File button se select karein.
+
+PRODUCT NAMES IMPORT
+
+Excel file mein sirf Column A use karein:
+
+Product Name
+Chawal
+Badam
+Kajhoor
+
+Software mein Import Products button se Excel file select karein.
+Imported names Add Product ke dropdown mein available honge.
+
+LOGO AND SCHEME
+
+- Default logo images\logo.jpeg mein included hai aur PDF ke top-right par display hoga.
+- Settings > Choose / Update se client apna PNG/JPG/JPEG logo select kar sakta hai.
+- Quantity ya Scheme enter karne par Scheme Value automatically Quantity x Scheme calculate hogi.
+- Client zarurat par Scheme Value ko manually bhi change kar sakta hai.
+
+HISTORY BACKUP / RESTORE
+
+- History khol kar Export Database Backup se apni invoices aur product list ki .db backup save karein.
+- Doosre PC ya reinstall ke baad History > Import Database Backup se wahi .db file restore karein.
+- Import current history replace karta hai; software pehle automatic safety backup banata hai.
+- Client-Ready folder mein koi customer database pehle se included nahi hai. Har client apni backup khud export karega.
+
+IMPORTANT
+
+- FinishLicenseAdmin.exe client ke liye nahi hai.
+- FinishLicenseAdmin.key kabhi client ko na bhejein.
+- Client ki .lic file Machine Code milne ke baad alag se bhejein.
